@@ -1,16 +1,82 @@
-from flask import Flask, render_template, request, flash, redirect, url_for
+
+from flask import Flask, render_template, request, flash, redirect, url_for, jsonify, session
+# from flask_sockets import Sockets
+from turbo_flask import Turbo#Used to keep the action screen dynamic
+
 import os
 import time
+import socket, select
+import random
+import json
+import threading
+
 os.system("pip install psycopg2-binary")
+os.system("pip install Flask-Session")
+os.system("pip install jquery") #used in the action screen html 
+os.system("pip install flask-celery")
+os.system("pip install redis")
+from celery import Celery
 import psycopg2
+
 # -- sample program from this video <https://youtu.be/6plVs_ytIH8>
 #  --specific code was created by Matt and james.
 
-app = Flask(__name__)#makes a class for the app or program we wish to run
-app.secret_key = "manbearpig_MUDMAN888" #required for flask to operate
+#Global Variables
+localIP     = "127.0.0.1"
+localPort   = 7501
+bufferSize  = 1024
 i = 0
+# List to store events
+events = ["Start","","","",""]
+numPlayers = 0
+RedTeamScore = 0
+BlueTeamScore = 0
 
-def insert_player(ID, FIRST_NAME, LAST_NAME, CODENAME):	# Call this to insert players into the database table player
+# Player Object
+class Player:
+	def __init__(self, IDno, Code, First, Last, teamName):
+		self.ID = IDno
+		self.Codename = Code
+		self.FirstName = First
+		self.LastName = Last
+		self.team = teamName
+		self.Score = 0
+		print("Player Created")
+	def getCode(self):
+		return self.Codename
+	def getTeam(self):
+		return self.team
+	def getScore(self):
+		return self.Score
+	def getID(self):
+		return self.ID
+	def score(self):
+		self.Score = self.Score+1
+
+#An array of player objects
+Players = []
+
+#Threading utility. I believe this is superfluous in the current implementation
+def make_celery(app):
+	celery = Celery(app.import_name, backend=app.config['CELERY_RESULT_BACKEND'], broker=app.config['CELERY_BROKER_URL'])
+	celery.conf.update(app.config)
+	
+	class ContextTask(celery.Task):
+		def __call__(self, *args, **kwargs):
+			with app.app_context():
+				return self.run(*args, **kwargs)
+	celery.Task = ContextTask
+	return celery
+
+#Setup of various packages
+app = Flask(__name__)#makes a class for the app or program we wish to run
+app.config.update(CELERY_BROKER_URL='redis://localhost:6379', CELERY_RESULT_BACKEND='redis://localhost:6379')
+app.secret_key = "manbearpig_MUDMAN888" #required for flask to operate
+celery = make_celery(app)
+turbo = Turbo(app)#Dynamic Page Updates
+
+#Add a player to the database.
+def insert_player(ID, FIRST_NAME, LAST_NAME, CODENAME, team):	# Call this to insert players into the database table player
 	conn = None
 	try:
 		conn = psycopg2.connect( # connects to database
@@ -32,21 +98,185 @@ def insert_player(ID, FIRST_NAME, LAST_NAME, CODENAME):	# Call this to insert pl
 		conn.commit() # commit the changes to the database
 		
 		cur.close() # close communication with the database
+		
+		print(ID)
+		print(FIRST_NAME)
+		print(LAST_NAME)
+		print(CODENAME)
+		
+		#Insert a player object into the player array
+		global Players
+		global numPlayers
+		Players.append(Player(ID, CODENAME, FIRST_NAME, LAST_NAME, team))
+		numPlayers = numPlayers+1
 	except (Exception, psycopg2.DatabaseError) as error:
 		print(error)
 	finally:
 		if conn is not None:
 			conn.close()
 
+#UDP Listener and action screen updater
+@celery.task()
+def listen_to_udp():
+	time.sleep(30)
+	UDPServerSocket = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)
+	UDPServerSocket.bind((localIP, localPort))
+	
+	global Players
+	global numPlayers
+	
+	#UDP receiver
+	while (True):
+		trafficEvents = UDPServerSocket.recvfrom(bufferSize)
+		#creates a message from the packet
+		msg="{}".format(trafficEvents[0])
+		print(msg)
+		
+
+#John's Code
+
+		i=2
+		player1=[]
+		player2=[]
+		strp1=""
+		strp2=""
+
+		while (msg[i]!= ":"):
+			player1.append(msg[i])
+			i+=1
+
+		i+=1
+		e=0
+		
+		while (i<len(msg)-1):
+			player2.append(msg[i])
+			e+=1
+			i+=1
+
+		for x in player1:
+			strp1+=x
+		for y in player2:
+			strp2+=y
+
+		strp1=str(strp1) #first number
+		strp2=str(strp2) #second number
+
+		
+		hitter = ""
+		hit = ""
+		BluePlayerNames = []
+		RedPlayerNames = []
+		
+		#Create arrays containing the info to print for all players
+		for item in Players:
+			teamPlus = 0
+			if(item.getID() == strp1):
+				item.score()
+				teamPlus = 1
+				hitter = item.getCode()
+			elif(item.getID() == strp2):
+				hit = item.getCode()
+			playerInfo = item.getCode() + " - " + str(item.getScore())
+			if(item.getTeam() == 1):
+				BluePlayerNames.append(playerInfo)
+				global BlueTeamScore
+				BlueTeamScore = BlueTeamScore + teamPlus
+			else:
+				RedPlayerNames.append(playerInfo)
+				global RedTeamScore
+				RedTeamScore = RedTeamScore + teamPlus
+		
+		#Update the array of events with the new event
+		events[4]=events[3]
+		events[3]=events[2]
+		events[2]=events[1]
+		events[1]=events[0]
+		events[0]=(hitter + " hit " + hit)
+		
+		BluePlayerNames.insert(0, ("Team Score - " + str(BlueTeamScore)))
+		RedPlayerNames.insert(0, ("Team Score - " + str(RedTeamScore)))
+		
+		#Push updates to the action screen html
+		turbo.push(turbo.replace(render_template('events.html',events = events), 'EVENT'))
+		turbo.push(turbo.replace(render_template('red_team.html',red_team = RedPlayerNames), 'RED'))
+		turbo.push(turbo.replace(render_template('blue_team.html',blue_team = BluePlayerNames), 'BLUE'))
+
+#Traffic generator provided by Mr. Strother
+@celery.task()
+def traffic_generator():
+	time.sleep(30)
+	
+	bufferSize  = 1024
+	serverAddressPort   = ("127.0.0.1", 7501)
+
+
+	print('this program will generate some test traffic for 2 players on the red ')
+	print('team as well as 2 players on the blue team')
+	print('')
+
+	# red1 = input('Enter codename of red player 1 ==> ')
+	# red2 = input('Enter codename of red player 2 ==> ')
+	# blue1 = input('Enter codename of blue player 1 ==> ')
+	# blue2 = input('Enter codename of blue player 2 ==> ')
+	
+	red1 = "John"
+	red2 = "James"
+	blue1 = "Matthew"
+	blue2 = "Ryan"
+
+	print('')
+	# counter = input('How many events do you want ==> ')
+	counter = 150
+	# Create datagram socket
+	UDPClientSocketTransmit = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)
+
+	# counter number of events, random player and order
+	i = 1
+	while i < int(counter):
+		if random.randint(1,2) == 1:
+			redplayer = red1
+		else:
+			redplayer = red2
+
+		if random.randint(1,2) == 1:
+			blueplayer = blue1
+		else: 
+			blueplayer = blue2	
+
+		# if random.randint(1,2) == 1:
+			# message = redplayer + " hit " + blueplayer
+		# else:
+			# message = blueplayer + " hit " + redplayer
+		
+		# if random.randint(1,2)==1:
+			# integer1=str(random.randint(1,2))
+			# integer2=str(random.randint(3,4))
+		# else:
+			# integer1=str(random.randint(3,4))
+			# integer2=str(random.randint(1,2))
+		
+		integer1 = random.randint(0,(numPlayers-1))
+		integer2 = random.randint(0,(numPlayers-1))
+
+		if(Players[integer1].getTeam() != Players[integer2].getTeam()):
+			message = Players[integer1].getID()+":"+Players[integer2].getID()
+			print(message)
+			i+=1;
+			UDPClientSocketTransmit.sendto(str.encode(str(message)), serverAddressPort)
+		time.sleep(random.randint(1,3))
+		
+	print("program complete")
 
 #Splash screen (default) route. Redirect to player entry screen after initializing components
 @app.route("/")#allows for us to change something when a user uses one of our inputs
 def splash():
 	return render_template('splash.html'),{"Refresh": "3; url=./playerEntry2"}
 
+#Current version of player entry screen
 @app.route("/playerEntry2", methods = ["POST", "GET"]) #player entry route to the player entry form in the html
 def edit():
-	if request.method == "POST":
+	if request.method == 'POST':
+		
 		#this method routes to the template for player entry
 		#it will allow the user to input data in the text boxes provided 
 		#when the user presses submit it will send the data to app.py
@@ -54,35 +284,111 @@ def edit():
 		#DB teams insert_player method
 
 		#data lists instantiated
-		iD = []
-		codename=[]
-		first_name=[]
-		last_name=[]
+
+		#Blue Team
+		iD_b = []
+		codename_b=[]
+		first_name_b=[]
+		last_name_b=[]
+
+		#Red Team
+		iD_r = []
+		codename_r=[]
+		first_name_r=[]
+		last_name_r=[]
+
 		#request data from the 'edit' form (check <form action="{{ url_for("edit")}}" ... in the html)
 		data = request.form
-		iD = data.getlist("player_id")#the .getlist("name") method is from the flask module. changes the dict to an indexable list
-		codename = data.getlist("player_codename")
-		first_name = data.getlist("player_first")
-		last_name = data.getlist("player_last")
+
+		#Blue Team
+		iD_b = data.getlist("player_id_b")#the .getlist("name") method is from the flask module. changes the dict to an indexable list
+		codename_b = data.getlist("player_codename_b")
+		first_name_b = data.getlist("player_first_b")
+		last_name_b = data.getlist("player_last_b")
+
+		#Red Team
+		iD_r = data.getlist("player_id_r")#the .getlist("name") method is from the flask module. changes the dict to an indexable list
+		codename_r = data.getlist("player_codename_r")
+		first_name_r = data.getlist("player_first_r")
+		last_name_r = data.getlist("player_last_r")
+
+		#Testing that data was gotten
+
 		#using try catch in case the program breaks
+			
 		try:
 			
-			for x in range(len(iD)): #there always be as many ID's as players				
-				insert_player(iD[x],first_name[x],last_name[x],codename[x])
-				#we need to filter blank inputs so as to not fill the database with empty entries  
-			
+			for x in range(len(iD_b)): #there always be as many ID's as players				
+				if(iD_b[x] == ''):
+					print("Skipping this line because the entire line was not filled out.")
+				elif(first_name_b[x] == ''):
+					print("Skipping this line because the entire line was not filled out.")
+				elif(last_name_b[x] == ''):
+					print("Skipping this line because the entire line was not filled out.")
+				elif(codename_b[x] == ''):
+					print("Skipping this line because the entire line was not filled out.")
+				else:
+					insert_player(iD_b[x],first_name_b[x],last_name_b[x],codename_b[x],1)
+				#we need to filter blank inputs so as to not fill the database with empty entries
 		except:
-			print("cant push data, check code")
+			print("cant push blue team data, check code")
+			
+		try:
+			
+			for x in range(len(iD_r)): #there always be as many ID's as players				
+				if(iD_r[x] == ''):
+					print("Skipping this line because the entire line was not filled out.")
+				elif(first_name_r[x] == ''):
+					print("Skipping this line because the entire line was not filled out.")
+				elif(last_name_r[x] == ''):
+					print("Skipping this line because the entire line was not filled out.")
+				elif(codename_r[x] == ''):
+					print("Skipping this line because the entire line was not filled out.")
+				else:
+					insert_player(iD_r[x],first_name_r[x],last_name_r[x],codename_r[x],2)
+				#we need to filter blank inputs so as to not fill the database with empty entries
+		except:
+			print("cant push red team data, check code")
+		#running list of players in current game
+		
 
+		session['blue_team'] = codename_b
+		session['red_team'] = codename_r
+		
 	return render_template("playerEntry2.html") #needs to be edited so that the user input persists
 
-@app.route("/playerReg", methods = ["POST", "GET"]) #player entry route to the player entry form in the html
-def regi():
-	#need a method for player registration for later sprint
-	#need html as well
-	#needs to be able to generate IDS and submit players 
-	pass
+#Action screen
+@app.route("/actionScreen", methods = ["GET"]) #game action screen page	
+def plyr_scrn():
+	
+	
+#This is the code which starts the UDP server and traffic generator
+#It should be with the code that executes during the game
+#If that code moves somewhere, please move this too
+	t1 = threading.Thread(target = listen_to_udp)
+	t1.start()
+	t2 = threading.Thread(target = traffic_generator)
+	t2.start()
+	print("UDP server up and listening")
+#End of UDP code
+	red_team_test = [""]
+	blue_team_test = [""]
+	
+	red_team_test.append(session.get('red_team',str))
+	blue_team_test.append(session.get('blue_team',str))
+	
+	red_team_test.append("")
+	blue_team_test.append("")
+	
+	print(red_team_test)
+	print(blue_team_test)
+	
+	return render_template("actionScreen.html")
 
+@app.route("/_event_update", methods = ["GET"]) #game action screen page	
+def event_update():
+	return jsonify(events)
 
+#Run the application
 if __name__ == "__main__":
 	app.run(debug=True)
